@@ -131,7 +131,10 @@ abstract class TransformerAbstract
             if ($childScope->getResource() instanceof Primitive) {
                 $includedData[$include] = $childScope->transformPrimitiveResource();
             } else {
-                $includedData[$include] = $childScope->toArray();
+                // Use toStreamedArray() so nested Collection includes are transformed
+                // one item at a time, preventing memory accumulation across all
+                // levels of the include chain (the core fix for the OOM crash).
+                $includedData[$include] = $childScope->toStreamedArray();
             }
         }
 

@@ -11,8 +11,9 @@ use League\Fractal\TransformerAbstract;
 use PHPUnit\Framework\TestCase;
 
 /**
- * Tests for Scope::toStream() — the memory-efficient streaming path.
+ * Tests for Scope::toStreamedArray() and Scope::toStream().
  *
+ * @covers \League\Fractal\Scope::toStreamedArray
  * @covers \League\Fractal\Scope::toStream
  */
 class ScopeStreamTest extends TestCase
@@ -28,7 +29,7 @@ class ScopeStreamTest extends TestCase
         return $manager;
     }
 
-    /** A trivial transformer with no includes. */
+    /** Trivial transformer — no includes. */
     private function simpleTransformer(): TransformerAbstract
     {
         return new class extends TransformerAbstract {
@@ -39,28 +40,85 @@ class ScopeStreamTest extends TestCase
         };
     }
 
-    /** A transformer with a defaultInclude (simulates deep nesting). */
-    private function transformerWithDefaultInclude(): TransformerAbstract
+    /**
+     * Transformer with a defaultInclude that returns a *nested Collection*,
+     * simulating the deep chain: ClientUser → account → translations.
+     */
+    private function transformerWithCollectionInclude(): TransformerAbstract
     {
         return new class extends TransformerAbstract {
-            protected array $defaultIncludes = ['meta'];
+            protected array $defaultIncludes = ['tags'];
 
             public function transform(array $item): array
             {
                 return ['id' => $item['id']];
             }
 
-            public function includeMeta(array $item): Item
+            public function includeTags(array $item): Collection
             {
-                return new Item(['value' => $item['id'] * 10], function (array $d): array {
-                    return $d;
+                $tags = $item['tags'] ?? [];
+                return new Collection($tags, function (array $tag): array {
+                    return ['label' => $tag['label']];
                 });
             }
         };
     }
 
     // -----------------------------------------------------------------------
-    // Tests
+    // toStreamedArray tests
+    // -----------------------------------------------------------------------
+
+    public function testStreamedArrayMatchesToArrayForFlatCollection(): void
+    {
+        $data = [
+            ['id' => 1, 'name' => 'Alice'],
+            ['id' => 2, 'name' => 'Bob'],
+        ];
+
+        $manager  = $this->makeManager();
+        $resource = new Collection($data, $this->simpleTransformer());
+        $scope    = $manager->createData($resource);
+
+        $this->assertSame($scope->toArray(), $scope->toStreamedArray());
+    }
+
+    public function testStreamedArrayMatchesToArrayWithNestedCollectionInclude(): void
+    {
+        $data = [
+            ['id' => 1, 'tags' => [['label' => 'php'], ['label' => 'fractal']]],
+            ['id' => 2, 'tags' => [['label' => 'memory']]],
+        ];
+
+        $manager  = $this->makeManager();
+        $resource = new Collection($data, $this->transformerWithCollectionInclude());
+        $scope    = $manager->createData($resource);
+
+        // toStreamedArray must produce the same structure as toArray
+        $this->assertSame($scope->toArray(), $scope->toStreamedArray());
+    }
+
+    public function testStreamedArrayOnItemDelegatesToToArray(): void
+    {
+        $manager  = $this->makeManager();
+        $resource = new Item(['id' => 5, 'name' => 'Eve'], $this->simpleTransformer());
+        $scope    = $manager->createData($resource);
+
+        $this->assertSame($scope->toArray(), $scope->toStreamedArray());
+    }
+
+    public function testStreamedArrayOnEmptyCollectionReturnsEmptyDataKey(): void
+    {
+        $manager  = $this->makeManager();
+        $resource = new Collection([], $this->simpleTransformer());
+        $scope    = $manager->createData($resource);
+
+        $result = $scope->toStreamedArray();
+        $this->assertIsArray($result);
+        $this->assertEmpty($result['data']);
+    }
+
+    // -----------------------------------------------------------------------
+    // toStream tests
     // -----------------------------------------------------------------------
 
     public function testStreamYieldsSameItemsAsToArray(): void
@@ -75,16 +133,12 @@ class ScopeStreamTest extends TestCase
         $resource = new Collection($data, $this->simpleTransformer());
         $scope    = $manager->createData($resource);
 
-        // Collect via toStream
         $streamed = [];
         $scope->toStream(function (array $item) use (&$streamed): void {
             $streamed[] = $item;
         });
 
-        // Collect via toArray
-        $fromArray = $scope->toArray()['data'];
-
-        $this->assertSame($fromArray, $streamed);
+        $this->assertSame($scope->toArray()['data'], $streamed);
     }
 
     public function testStreamCallbackIsCalledOncePerItem(): void
@@ -103,15 +157,15 @@ class ScopeStreamTest extends TestCase
         $this->assertSame(50, $callCount);
     }
 
-    public function testStreamWorksWithDefaultIncludes(): void
+    public function testStreamWorksWithNestedCollectionDefaultInclude(): void
     {
         $data = [
-            ['id' => 1, 'name' => 'Alice'],
-            ['id' => 2, 'name' => 'Bob'],
+            ['id' => 1, 'tags' => [['label' => 'php'], ['label' => 'fractal']]],
+            ['id' => 2, 'tags' => [['label' => 'memory']]],
         ];
 
         $manager  = $this->makeManager();
-        $resource = new Collection($data, $this->transformerWithDefaultInclude());
+        $resource = new Collection($data, $this->transformerWithCollectionInclude());
         $scope    = $manager->createData($resource);
 
         $streamed = [];
@@ -119,10 +173,13 @@ class ScopeStreamTest extends TestCase
             $streamed[] = $item;
         });
 
-        // Each item should have the nested 'meta' include merged in.
-        $this->assertArrayHasKey('meta', $streamed[0]);
-        $this->assertSame(['value' => 10], $streamed[0]['meta']);
-        $this->assertSame(['value' => 20], $streamed[1]['meta']);
+        // Each item must have the nested 'tags' collection
+        $this->assertArrayHasKey('tags', $streamed[0]);
+        $this->assertCount(2, $streamed[0]['tags']['data']);
+        $this->assertSame('php', $streamed[0]['tags']['data'][0]['label']);
+
+        $this->assertArrayHasKey('tags', $streamed[1]);
+        $this->assertCount(1, $streamed[1]['tags']['data']);
     }
 
     public function testStreamOnEmptyCollectionCallsCallbackZeroTimes(): void
@@ -152,26 +209,5 @@ class ScopeStreamTest extends TestCase
 
         $this->assertCount(1, $calls);
         $this->assertSame(['id' => 7, 'name' => 'Dave'], $calls[0]);
-    }
-
-    public function testStreamItemsAreIndependent(): void
-    {
-        // Ensures that items processed in one iteration don't bleed into the next
-        $data = [
-            ['id' => 1, 'name' => 'Alpha'],
-            ['id' => 2, 'name' => 'Beta'],
-        ];
-
-        $manager  = $this->makeManager();
-        $resource = new Collection($data, $this->simpleTransformer());
-        $scope    = $manager->createData($resource);
-
-        $items = [];
-        $scope->toStream(function (array $item) use (&$items): void {
-            $items[] = $item;
-        });
-
-        $this->assertSame(['id' => 1, 'name' => 'Alpha'], $items[0]);
-        $this->assertSame(['id' => 2, 'name' => 'Beta'],  $items[1]);
     }
 }

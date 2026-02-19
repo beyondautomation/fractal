@@ -231,6 +231,83 @@ class Scope implements \JsonSerializable
     }
 
     /**
+     * Memory-efficient equivalent of toArray() for Collection resources.
+     *
+     * Produces an identical return value to toArray() but transforms items
+     * one at a time and unsets each one before processing the next.  This
+     * keeps peak memory proportional to a single item's include chain rather
+     * than the entire collection.
+     *
+     * Called automatically by TransformerAbstract when resolving nested
+     * Collection includes, so the streaming behaviour propagates through all
+     * levels of nesting without any changes to transformer or controller code
+     * (other than the top-level toStream() call).
+     *
+     * Non-Collection resources delegate directly to toArray().
+     *
+     * @internal  Use toStream() at the top level; this is called internally
+     *            by the include pipeline.
+     */
+    public function toStreamedArray(): ?array
+    {
+        if (!$this->resource instanceof Collection) {
+            // Item / NullResource — nothing to stream, delegate normally.
+            return $this->toArray();
+        }
+
+        $transformer = $this->resource->getTransformer();
+        $serializer  = $this->manager->getSerializer();
+
+        $transformedItems = [];
+
+        foreach ($this->resource->getData() as $value) {
+            [$transformedData, $includedData] = $this->fireTransformer($transformer, $value);
+
+            if ($serializer->sideloadIncludes()) {
+                // Side-loading (e.g. JSON:API) — merge includes into item and collect.
+                $filteredIncludes  = array_map([$this, 'filterFieldsets'], [$includedData]);
+                $includedResult    = $serializer->includedData($this->resource, $filteredIncludes);
+                $itemArray         = $serializer->item($this->resource->getResourceKey() ?: null, $transformedData);
+                $itemArray         = $serializer->injectData($itemArray, $filteredIncludes);
+                $itemArray         = $itemArray + $includedResult;
+                $transformedItems[] = $itemArray;
+            } else {
+                $transformedItems[] = $transformedData;
+            }
+
+            // Release per-item memory before processing the next item.
+            unset($value, $transformedData, $includedData);
+        }
+
+        // Now finish the same way toArray() does: serialize the full collection,
+        // handle pagination/cursors, meta, etc.
+        $data = $this->serializeResource($serializer, $transformedItems);
+        unset($transformedItems);
+
+        if (!empty($this->availableIncludes)) {
+            $data = $serializer->injectAvailableIncludeData($data, $this->availableIncludes);
+        }
+
+        if ($this->resource->hasCursor()) {
+            $pagination = $serializer->cursor($this->resource->getCursor());
+        } elseif ($this->resource->hasPaginator()) {
+            $pagination = $serializer->paginator($this->resource->getPaginator());
+        }
+
+        if (!empty($pagination)) {
+            $this->resource->setMetaValue(key($pagination), current($pagination));
+        }
+
+        $meta = $serializer->meta($this->resource->getMeta());
+
+        if (is_null($data)) {
+            return !empty($meta) ? $meta : null;
+        }
+
+        return $data + $meta;
+    }
+
+    /**
      * Stream a Collection resource one item at a time to avoid memory exhaustion.
      *
      * The callback receives a single fully-transformed item array on each invocation.

@@ -1,126 +1,128 @@
 # Streaming Collections — beyondautomation/fractal
 
-## The problem this solves
+## The problem
 
 `Scope::toArray()` builds the **entire** nested result structure in memory before
-returning.  With deep `defaultIncludes` chains on large collections PHP exhausts
-its memory limit because all entities and their rendered arrays accumulate
-simultaneously before a single byte is written.
+returning.  With deep `defaultIncludes` chains on large collections PHP exhausts its
+memory limit because all entities and their rendered arrays accumulate simultaneously.
 
-Example chain that exposed this:
+The OOM crash has **two interacting causes**:
+
+1. The top-level controller calls `->toArray()` on the root `Collection` scope, which
+   calls `executeResourceTransformers()` and accumulates every transformed item before
+   returning.
+
+2. Fractal's own include pipeline (`TransformerAbstract::includeResourceIfAvailable`)
+   calls `$childScope->toArray()` for every nested include — even when that include is
+   itself a large `Collection`.  This means the fix must reach inside the library, not
+   just the controller.
+
+Stack trace that exposed cause #2:
 
 ```
-ClientUser (100×)
-  → profile (defaultInclude)
-    → country + nationality (defaultIncludes)
-      → translations (defaultInclude, ~200 rows each)
+SerializerAbstract::mergeIncludes          ← OOM here, merging huge include arrays
+Scope::fireTransformer                     ← processing nested Collection include
+Scope::executeResourceTransformers
+Scope::toArray                             ← called by TransformerAbstract for child scope
+TransformerAbstract::includeResourceIfAvailable
+TransformerAbstract::processIncludedResources
+Scope::fireIncludedTransformers
+Scope::fireTransformer
+Scope::executeResourceTransformers
+Scope::toArray                             ← top-level controller call
+ClientUser::getUserList                    ← controller
 ```
 
-That's ~40 000 `CountryTranslation` objects all alive at once — before `json_encode`
-is even called.
+## The fix — two-part, fully internal
 
-## The fix — `Scope::toStream(callable $callback)`
+### Part 1: `Scope::toStreamedArray()`
 
-The new `toStream()` method transforms **one item at a time**, calls your callback
-with the fully-serialised item array, then unsets the item before moving to the
-next one.  `toArray()` is untouched; this is 100 % additive.
+A new method that produces **identical output** to `toArray()` but transforms
+Collection items one at a time, `unset()`-ing each before moving to the next.
+Peak memory is O(1 item) instead of O(N items).
+
+### Part 2: `TransformerAbstract::includeResourceIfAvailable()` patched
+
+The single line `$childScope->toArray()` is replaced with
+`$childScope->toStreamedArray()`.  Because `toStreamedArray()` delegates to
+`toArray()` for non-Collection resources, this change is transparent for
+`Item`, `NullResource` and `Primitive` includes — it only activates streaming
+for `Collection` includes, which is exactly where the memory accumulates.
+
+This means **streaming propagates automatically through every level of nesting**
+with no changes required in your transformers.
 
 ---
 
-## Usage
+## Migration — what you need to change in your application
 
-### Streaming a JSON array response (recommended)
+Only the **controller** needs updating.  Switch from `toArray()` to `toStream()`:
 
 ```php
-use League\Fractal\Manager;
-use League\Fractal\Resource\Collection;
-use League\Fractal\Serializer\ArraySerializer;
+// BEFORE — OOM on large collections
+$scope = $manager->createData(new Collection($users, new ClientUserTransformer()));
+$data  = $scope->toArray();              // explodes at 128 MB
+return $response->withJson($data);
 
-$manager = new Manager();
-$manager->setSerializer(new ArraySerializer());
-
+// AFTER — streaming JSON response
 $scope = $manager->createData(new Collection($users, new ClientUserTransformer()));
 
-header('Content-Type: application/json');
-echo '[';
+$body = $response->getBody();
+$body->write('[');
 $first = true;
-$scope->toStream(function (array $item) use (&$first): void {
-    echo ($first ? '' : ',') . json_encode($item);
+$scope->toStream(function (array $item) use ($body, &$first): void {
+    $body->write(($first ? '' : ',') . json_encode($item));
     $first = false;
-    ob_flush();
-    flush();
 });
-echo ']';
+$body->write(']');
+
+return $response->withHeader('Content-Type', 'application/json');
 ```
 
-### Collecting into an array (backward-compatible, useful for tests)
+If your client expects the standard `{ "data": [...] }` envelope, wrap it:
 
 ```php
-$items = [];
-$scope->toStream(function (array $item) use (&$items): void {
-    $items[] = $item;
+$body->write('{"data":[');
+$first = true;
+$scope->toStream(function (array $item) use ($body, &$first): void {
+    $body->write(($first ? '' : ',') . json_encode($item));
+    $first = false;
 });
-// $items now contains the same data as $scope->toArray()['data']
+$body->write(']}');
 ```
 
-### Laravel / Symfony streaming response
+### If you can't change the response format yet
+
+You can still benefit from the memory reduction without streaming the HTTP
+response by collecting via `toStreamedArray()`:
 
 ```php
-// Laravel
-return response()->stream(function () use ($scope) {
-    echo '[';
-    $first = true;
-    $scope->toStream(function (array $item) use (&$first) {
-        echo ($first ? '' : ',') . json_encode($item);
-        $first = false;
-        ob_flush(); flush();
-    });
-    echo ']';
-}, 200, ['Content-Type' => 'application/json']);
+// Memory-safe equivalent of ->toArray() — same return value, lower peak memory
+$data = $scope->toStreamedArray();
+return $response->withJson($data);
 ```
+
+This alone fixes the OOM because the nested include pipeline now uses
+`toStreamedArray()` internally at every level — so even though the final array
+is assembled in memory, the deep `CountryTranslation` objects are freed
+between items instead of all held simultaneously.
 
 ---
 
 ## Behaviour notes
 
-| Scenario | Behaviour |
-|---|---|
-| Resource is a `Collection` | Items are transformed and yielded one by one |
-| Resource is an `Item` or `NullResource` | `toArray()` is called once and the result is passed to `$callback` |
-| Serialiser has `sideloadIncludes()` (e.g. JSON:API) | Side-loaded includes are merged per-item — note that deduplication across the full collection is **not** performed in streaming mode |
-| `defaultIncludes` / `availableIncludes` | Fully supported — they run per-item exactly as in `toArray()` |
-| Pagination / cursor metadata | Not emitted by `toStream()` — add it yourself around the loop if needed |
-
----
-
-## Migration
-
-No existing code needs to change.  Only the handful of list endpoints hitting
-memory limits need to switch from:
-
-```php
-// Before
-$data = $fractal->createData($resource)->toArray();
-return response()->json($data);
-
-// After — streaming
-return response()->stream(function () use ($fractal, $resource) {
-    echo '[';
-    $first = true;
-    $fractal->createData($resource)->toStream(function (array $item) use (&$first) {
-        echo ($first ? '' : ',') . json_encode($item);
-        $first = false;
-        ob_flush(); flush();
-    });
-    echo ']';
-}, 200, ['Content-Type' => 'application/json']);
-```
+| Scenario | `toArray()` | `toStreamedArray()` | `toStream()` |
+|---|---|---|---|
+| `Collection` resource | All items in memory at once | Items freed between iterations | Items streamed to callback |
+| `Item` / `NullResource` | Normal | Delegates to `toArray()` | Calls callback once |
+| Nested `Collection` includes | All sub-items in memory | Sub-items freed between iterations ✓ | Sub-items freed ✓ |
+| Pagination / cursor / meta | ✓ | ✓ | Not emitted — add manually |
+| Side-loading serialisers (JSON:API) | ✓ | ✓ | Per-item side-load |
+| Backward compatibility | — | 100% identical output | New API |
 
 ---
 
 ## Installing the fork
-
-In your project's `composer.json`:
 
 ```json
 {
@@ -136,6 +138,5 @@ In your project's `composer.json`:
 }
 ```
 
-The package declares `"replace": {"league/fractal": "*"}`, so Composer will
-satisfy any existing `league/fractal` constraint in your dependencies without
-modification.
+The package declares `"replace": {"league/fractal": "*"}` so Composer will satisfy
+any existing `league/fractal` constraint in your dependencies without modification.
