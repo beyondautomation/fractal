@@ -231,6 +231,74 @@ class Scope implements \JsonSerializable
     }
 
     /**
+     * Stream a Collection resource one item at a time to avoid memory exhaustion.
+     *
+     * The callback receives a single fully-transformed item array on each invocation.
+     * After the callback returns the item is freed from memory before the next one
+     * is processed — which is the key difference from toArray().
+     *
+     * Usage in a controller (streaming JSON response):
+     *
+     *   $scope = $manager->createData(new Collection($users, new UserTransformer));
+     *
+     *   header('Content-Type: application/json');
+     *   echo '[';
+     *   $first = true;
+     *   $scope->toStream(function (array $item) use (&$first) {
+     *       echo ($first ? '' : ',') . json_encode($item);
+     *       $first = false;
+     *       ob_flush(); flush();
+     *   });
+     *   echo ']';
+     *
+     * Or collect results (same peak memory as toArray() — useful for tests):
+     *
+     *   $items = [];
+     *   $scope->toStream(function (array $item) use (&$items) { $items[] = $item; });
+     *
+     * Non-Collection resources fall back to calling $callback once with the full toArray() result.
+     *
+     * @param callable(array $item): void $callback
+     */
+    public function toStream(callable $callback): void
+    {
+        if (!$this->resource instanceof Collection) {
+            // For Item / NullResource there is nothing to stream — just call back once.
+            $result = $this->toArray();
+            if ($result !== null) {
+                $callback($result);
+            }
+            return;
+        }
+
+        $transformer = $this->resource->getTransformer();
+        $serializer  = $this->manager->getSerializer();
+
+        foreach ($this->resource->getData() as $value) {
+            // Transform the single item (including all nested defaultIncludes).
+            [$transformedData, $includedData] = $this->fireTransformer($transformer, $value);
+
+            // Serialise to an item-shaped array.
+            $resourceKey = $this->resource->getResourceKey();
+            $itemArray   = $serializer->item($resourceKey ?: null, $transformedData);
+
+            // Side-load includes if the serialiser requires it (e.g. JSON API).
+            if ($serializer->sideloadIncludes()) {
+                $filteredIncludes = array_map([$this, 'filterFieldsets'], [$includedData]);
+                $includedResult   = $serializer->includedData($this->resource, $filteredIncludes);
+                $itemArray        = $serializer->injectData($itemArray, $filteredIncludes);
+                $itemArray        = $itemArray + $includedResult;
+            }
+
+            // Deliver to the caller.
+            $callback($itemArray);
+
+            // Explicitly free memory before the next iteration.
+            unset($value, $transformedData, $includedData, $itemArray);
+        }
+    }
+
+    /**
      * @return mixed
      */
     #[\ReturnTypeWillChange]
